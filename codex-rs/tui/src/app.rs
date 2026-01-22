@@ -996,6 +996,10 @@ impl App {
                     }
                 }
                 Op::UserInputAnswer { id, response } => {
+                    if crate::chatwidget::ChatWidget::is_share_request_id(&id) {
+                        self.chat_widget.handle_share_response(response);
+                        return Ok(AppRunControl::Continue);
+                    }
                     if let Some((thread_id, original_id)) =
                         self.external_approval_routes.remove(&id)
                     {
