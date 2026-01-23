@@ -1,4 +1,5 @@
 use crate::codex_message_processor::ApiVersion;
+use crate::codex_message_processor::CollaborationModeKind;
 use crate::codex_message_processor::PendingInterrupts;
 use crate::codex_message_processor::PendingRollbacks;
 use crate::codex_message_processor::PendingTurnModes;
@@ -87,7 +88,6 @@ use codex_core::protocol::TurnDiffEvent;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::items::TurnItem;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ReviewOutputEvent;
@@ -579,6 +579,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             )
             .await
             {
+                // Plan-mode turns materialize a final `plan` item instead of streaming assistant text.
                 return;
             }
             let notification = AgentMessageDeltaNotification {
@@ -763,6 +764,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 )
                 .await
             {
+                // Suppress agent message items for plan-mode turns so we don't emit both
+                // an agent message and the synthesized `plan` item at turn completion.
                 return;
             }
             let item: ThreadItem = item_started_event.item.clone().into();
@@ -786,6 +789,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 )
                 .await
             {
+                // Same suppression as ItemStarted: plan-mode turns synthesize a `plan`
+                // item at completion, so we drop the agent message item completion.
                 return;
             }
             let item: ThreadItem = item_completed_event.item.clone().into();
@@ -1129,8 +1134,8 @@ pub(crate) async fn apply_bespoke_event_handling(
     }
 }
 
-fn is_plan_mode(mode: &CollaborationMode) -> bool {
-    matches!(mode, CollaborationMode::Plan(_))
+fn is_plan_mode(mode: &CollaborationModeKind) -> bool {
+    matches!(mode, CollaborationModeKind::Plan)
 }
 
 async fn is_plan_mode_turn(
@@ -1143,7 +1148,7 @@ async fn is_plan_mode_turn(
         let summaries = turn_summary_store.lock().await;
         summaries
             .get(&conversation_id)
-            .and_then(|summary| summary.turn_mode.as_ref())
+            .and_then(|summary| summary.collaboration_mode_at_turn_start.as_ref())
             .is_some_and(is_plan_mode)
     };
     if summary_is_plan {
@@ -1179,14 +1184,11 @@ async fn snapshot_turn_mode(
     if let Some(turn_mode) = turn_mode {
         {
             let mut modes = turn_mode_store.lock().await;
-            modes.insert(
-                (conversation_id, event_turn_id.to_string()),
-                turn_mode.clone(),
-            );
+            modes.insert((conversation_id, event_turn_id.to_string()), turn_mode);
         }
         let mut summaries = turn_summary_store.lock().await;
         let summary = summaries.entry(conversation_id).or_default();
-        summary.turn_mode = Some(turn_mode);
+        summary.collaboration_mode_at_turn_start = Some(turn_mode);
     }
 }
 
@@ -1402,12 +1404,14 @@ async fn handle_turn_complete(
     let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
     let TurnSummary {
         last_error,
-        turn_mode,
+        collaboration_mode_at_turn_start,
         last_plan_update,
         ..
     } = turn_summary;
 
-    let plan_mode = turn_mode.as_ref().is_some_and(is_plan_mode);
+    let plan_mode = collaboration_mode_at_turn_start
+        .as_ref()
+        .is_some_and(is_plan_mode);
 
     let (status, error) = match last_error {
         Some(error) => (TurnStatus::Failed, Some(error)),
@@ -1934,6 +1938,7 @@ async fn construct_mcp_tool_call_end_notification(
 mod tests {
     use super::*;
     use crate::CHANNEL_CAPACITY;
+    use crate::codex_message_processor::CollaborationModeKind;
     use crate::outgoing_message::OutgoingMessage;
     use crate::outgoing_message::OutgoingMessageSender;
     use anyhow::Result;
@@ -1947,7 +1952,6 @@ mod tests {
     use codex_core::protocol::RateLimitWindow;
     use codex_core::protocol::TokenUsage;
     use codex_core::protocol::TokenUsageInfo;
-    use codex_protocol::config_types::Settings;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use mcp_types::CallToolResult;
@@ -2145,14 +2149,10 @@ mod tests {
         let pending_turn_modes = new_pending_turn_modes();
         let turn_mode_store = new_turn_mode_store();
         let turn_summary_store = new_turn_summary_store();
-        let plan_mode = CollaborationMode::Plan(Settings {
-            model: "mock-model".to_string(),
-            reasoning_effort: None,
-            developer_instructions: None,
-        });
+        let plan_mode = CollaborationModeKind::Plan;
         {
             let mut pending = pending_turn_modes.lock().await;
-            pending.insert(conversation_id, VecDeque::from([Some(plan_mode.clone())]));
+            pending.insert(conversation_id, VecDeque::from([Some(plan_mode)]));
         }
 
         snapshot_turn_mode(
@@ -2173,7 +2173,7 @@ mod tests {
         let summary = summaries
             .get(&conversation_id)
             .ok_or_else(|| anyhow!("summary should exist"))?;
-        assert_eq!(summary.turn_mode.as_ref(), Some(&plan_mode));
+        assert_eq!(summary.collaboration_mode_at_turn_start, Some(plan_mode));
         drop(summaries);
 
         let pending = pending_turn_modes.lock().await;
@@ -2190,11 +2190,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
 
-        let plan_mode = CollaborationMode::Plan(Settings {
-            model: "mock-model".to_string(),
-            reasoning_effort: None,
-            developer_instructions: None,
-        });
+        let plan_mode = CollaborationModeKind::Plan;
         let explanation = Some("plan it".to_string());
         let plan_update = UpdatePlanArgs {
             explanation: explanation.clone(),
@@ -2225,7 +2221,7 @@ mod tests {
             map.insert(
                 conversation_id,
                 TurnSummary {
-                    turn_mode: Some(plan_mode),
+                    collaboration_mode_at_turn_start: Some(plan_mode),
                     last_plan_update: Some(plan_update),
                     ..Default::default()
                 },

@@ -215,14 +215,34 @@ pub(crate) type PendingRollbacks = Arc<Mutex<HashMap<ThreadId, RequestId>>>;
 pub(crate) struct TurnSummary {
     pub(crate) file_change_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
-    pub(crate) turn_mode: Option<CollaborationMode>,
+    pub(crate) collaboration_mode_at_turn_start: Option<CollaborationModeKind>,
     pub(crate) last_plan_update: Option<UpdatePlanArgs>,
 }
 
 pub(crate) type TurnSummaryStore = Arc<Mutex<HashMap<ThreadId, TurnSummary>>>;
 pub(crate) type PendingTurnModes =
-    Arc<Mutex<HashMap<ThreadId, VecDeque<Option<CollaborationMode>>>>>;
-pub(crate) type TurnModeStore = Arc<Mutex<HashMap<(ThreadId, String), CollaborationMode>>>;
+    Arc<Mutex<HashMap<ThreadId, VecDeque<Option<CollaborationModeKind>>>>>;
+pub(crate) type TurnModeStore = Arc<Mutex<HashMap<(ThreadId, String), CollaborationModeKind>>>;
+
+/// A turn-scoped snapshot of collaboration mode that is stable even if session mode changes mid-turn.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum CollaborationModeKind {
+    Plan,
+    PairProgramming,
+    Execute,
+    Custom,
+}
+
+impl From<&CollaborationMode> for CollaborationModeKind {
+    fn from(mode: &CollaborationMode) -> Self {
+        match mode {
+            CollaborationMode::Plan(_) => Self::Plan,
+            CollaborationMode::PairProgramming(_) => Self::PairProgramming,
+            CollaborationMode::Execute(_) => Self::Execute,
+            CollaborationMode::Custom(_) => Self::Custom,
+        }
+    }
+}
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -3638,9 +3658,14 @@ impl CodexMessageProcessor {
             }
         };
 
-        let effective_mode = collaboration_mode
-            .clone()
-            .or_else(|| self.current_collaboration_modes.get(&thread_id).cloned());
+        let effective_mode_kind = collaboration_mode
+            .as_ref()
+            .map(CollaborationModeKind::from)
+            .or_else(|| {
+                self.current_collaboration_modes
+                    .get(&thread_id)
+                    .map(CollaborationModeKind::from)
+            });
         if let Some(mode) = collaboration_mode.clone() {
             self.current_collaboration_modes.insert(thread_id, mode);
         }
@@ -3649,7 +3674,7 @@ impl CodexMessageProcessor {
             pending
                 .entry(thread_id)
                 .or_default()
-                .push_back(effective_mode);
+                .push_back(effective_mode_kind);
         }
 
         // Map v2 input items to core input items.
