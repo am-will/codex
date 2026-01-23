@@ -35,6 +35,7 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::ExecPolicyAmendment;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::TurnItem;
@@ -2218,6 +2219,7 @@ mod handlers {
 
     use crate::context_manager::is_user_turn_boundary;
     use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
     use codex_protocol::user_input::UserInput;
     use codex_rmcp_client::ElicitationAction;
