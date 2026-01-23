@@ -1,6 +1,8 @@
 use crate::codex_message_processor::ApiVersion;
 use crate::codex_message_processor::PendingInterrupts;
 use crate::codex_message_processor::PendingRollbacks;
+use crate::codex_message_processor::PendingTurnModes;
+use crate::codex_message_processor::TurnModeStore;
 use crate::codex_message_processor::TurnSummary;
 use crate::codex_message_processor::TurnSummaryStore;
 use crate::codex_message_processor::read_event_msgs_from_rollout;
@@ -85,6 +87,8 @@ use codex_core::protocol::TurnDiffEvent;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::items::TurnItem;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
@@ -106,6 +110,8 @@ pub(crate) async fn apply_bespoke_event_handling(
     outgoing: Arc<OutgoingMessageSender>,
     pending_interrupts: PendingInterrupts,
     pending_rollbacks: PendingRollbacks,
+    pending_turn_modes: PendingTurnModes,
+    turn_mode_store: TurnModeStore,
     turn_summary_store: TurnSummaryStore,
     api_version: ApiVersion,
     fallback_model_provider: String,
@@ -120,6 +126,17 @@ pub(crate) async fn apply_bespoke_event_handling(
                 conversation_id,
                 event_turn_id,
                 &outgoing,
+                &turn_mode_store,
+                &turn_summary_store,
+            )
+            .await;
+        }
+        EventMsg::TurnStarted(_) => {
+            snapshot_turn_mode(
+                conversation_id,
+                &event_turn_id,
+                &pending_turn_modes,
+                &turn_mode_store,
                 &turn_summary_store,
             )
             .await;
@@ -554,6 +571,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::AgentMessageContentDelta(event) => {
+            if is_plan_mode_turn(
+                conversation_id,
+                &event_turn_id,
+                &turn_summary_store,
+                &turn_mode_store,
+            )
+            .await
+            {
+                return;
+            }
             let notification = AgentMessageDeltaNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
@@ -726,6 +753,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::ItemStarted(item_started_event) => {
+            let is_agent_message = matches!(&item_started_event.item, TurnItem::AgentMessage(_));
+            if is_agent_message
+                && is_plan_mode_turn(
+                    conversation_id,
+                    &event_turn_id,
+                    &turn_summary_store,
+                    &turn_mode_store,
+                )
+                .await
+            {
+                return;
+            }
             let item: ThreadItem = item_started_event.item.clone().into();
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -737,6 +776,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::ItemCompleted(item_completed_event) => {
+            let is_agent_message = matches!(&item_completed_event.item, TurnItem::AgentMessage(_));
+            if is_agent_message
+                && is_plan_mode_turn(
+                    conversation_id,
+                    &event_turn_id,
+                    &turn_summary_store,
+                    &turn_mode_store,
+                )
+                .await
+            {
+                return;
+            }
             let item: ThreadItem = item_completed_event.item.clone().into();
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -995,6 +1046,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 conversation_id,
                 event_turn_id,
                 &outgoing,
+                &turn_mode_store,
                 &turn_summary_store,
             )
             .await;
@@ -1068,11 +1120,73 @@ pub(crate) async fn apply_bespoke_event_handling(
                 plan_update_event,
                 api_version,
                 outgoing.as_ref(),
+                &turn_summary_store,
             )
             .await;
         }
 
         _ => {}
+    }
+}
+
+fn is_plan_mode(mode: &CollaborationMode) -> bool {
+    matches!(mode, CollaborationMode::Plan(_))
+}
+
+async fn is_plan_mode_turn(
+    conversation_id: ThreadId,
+    event_turn_id: &str,
+    turn_summary_store: &TurnSummaryStore,
+    turn_mode_store: &TurnModeStore,
+) -> bool {
+    let summary_is_plan = {
+        let summaries = turn_summary_store.lock().await;
+        summaries
+            .get(&conversation_id)
+            .and_then(|summary| summary.turn_mode.as_ref())
+            .is_some_and(is_plan_mode)
+    };
+    if summary_is_plan {
+        return true;
+    }
+    let key = (conversation_id, event_turn_id.to_string());
+    let modes = turn_mode_store.lock().await;
+    modes.get(&key).is_some_and(is_plan_mode)
+}
+
+async fn snapshot_turn_mode(
+    conversation_id: ThreadId,
+    event_turn_id: &str,
+    pending_turn_modes: &PendingTurnModes,
+    turn_mode_store: &TurnModeStore,
+    turn_summary_store: &TurnSummaryStore,
+) {
+    let turn_mode = {
+        let mut pending = pending_turn_modes.lock().await;
+        let next_mode = pending
+            .get_mut(&conversation_id)
+            .and_then(|queue| queue.pop_front())
+            .flatten();
+        let should_remove = pending
+            .get(&conversation_id)
+            .is_some_and(std::collections::VecDeque::is_empty);
+        if should_remove {
+            pending.remove(&conversation_id);
+        }
+        next_mode
+    };
+
+    if let Some(turn_mode) = turn_mode {
+        {
+            let mut modes = turn_mode_store.lock().await;
+            modes.insert(
+                (conversation_id.clone(), event_turn_id.to_string()),
+                turn_mode.clone(),
+            );
+        }
+        let mut summaries = turn_summary_store.lock().await;
+        let summary = summaries.entry(conversation_id).or_default();
+        summary.turn_mode = Some(turn_mode);
     }
 }
 
@@ -1101,7 +1215,13 @@ async fn handle_turn_plan_update(
     plan_update_event: UpdatePlanArgs,
     api_version: ApiVersion,
     outgoing: &OutgoingMessageSender,
+    turn_summary_store: &TurnSummaryStore,
 ) {
+    {
+        let mut map = turn_summary_store.lock().await;
+        let summary = map.entry(conversation_id).or_default();
+        summary.last_plan_update = Some(plan_update_event.clone());
+    }
     if let ApiVersion::V2 = api_version {
         let notification = TurnPlanUpdatedNotification {
             thread_id: conversation_id.to_string(),
@@ -1233,19 +1353,79 @@ async fn find_and_remove_turn_summary(
     map.remove(&conversation_id).unwrap_or_default()
 }
 
+async fn emit_plan_item(
+    conversation_id: ThreadId,
+    event_turn_id: &str,
+    plan_update: UpdatePlanArgs,
+    outgoing: &OutgoingMessageSender,
+) {
+    let plan_item_id = format!("{event_turn_id}-plan");
+    let plan = plan_update
+        .plan
+        .into_iter()
+        .map(TurnPlanStep::from)
+        .collect();
+    let item = ThreadItem::Plan {
+        id: plan_item_id,
+        explanation: plan_update.explanation,
+        plan,
+    };
+    let started = ItemStartedNotification {
+        thread_id: conversation_id.to_string(),
+        turn_id: event_turn_id.to_string(),
+        item: item.clone(),
+    };
+    outgoing
+        .send_server_notification(ServerNotification::ItemStarted(started))
+        .await;
+    let completed = ItemCompletedNotification {
+        thread_id: conversation_id.to_string(),
+        turn_id: event_turn_id.to_string(),
+        item,
+    };
+    outgoing
+        .send_server_notification(ServerNotification::ItemCompleted(completed))
+        .await;
+}
+
 async fn handle_turn_complete(
     conversation_id: ThreadId,
     event_turn_id: String,
     outgoing: &OutgoingMessageSender,
+    turn_mode_store: &TurnModeStore,
     turn_summary_store: &TurnSummaryStore,
 ) {
+    {
+        let mut modes = turn_mode_store.lock().await;
+        modes.remove(&(conversation_id.clone(), event_turn_id.clone()));
+    }
     let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let TurnSummary {
+        last_error,
+        turn_mode,
+        last_plan_update,
+        ..
+    } = turn_summary;
 
-    let (status, error) = match turn_summary.last_error {
+    let plan_mode = turn_mode.as_ref().is_some_and(is_plan_mode);
+
+    let (status, error) = match last_error {
         Some(error) => (TurnStatus::Failed, Some(error)),
         None => (TurnStatus::Completed, None),
     };
 
+    if matches!(status, TurnStatus::Completed)
+        && plan_mode
+        && let Some(plan_update) = last_plan_update
+    {
+        emit_plan_item(
+            conversation_id.clone(),
+            &event_turn_id,
+            plan_update,
+            outgoing,
+        )
+        .await;
+    }
     emit_turn_completed_with_status(conversation_id, event_turn_id, status, error, outgoing).await;
 }
 
@@ -1253,8 +1433,13 @@ async fn handle_turn_interrupted(
     conversation_id: ThreadId,
     event_turn_id: String,
     outgoing: &OutgoingMessageSender,
+    turn_mode_store: &TurnModeStore,
     turn_summary_store: &TurnSummaryStore,
 ) {
+    {
+        let mut modes = turn_mode_store.lock().await;
+        modes.remove(&(conversation_id.clone(), event_turn_id.clone()));
+    }
     find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
 
     emit_turn_completed_with_status(
@@ -1760,6 +1945,7 @@ mod tests {
     use anyhow::Result;
     use anyhow::anyhow;
     use anyhow::bail;
+    use codex_app_server_protocol::TurnPlanStep;
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_core::protocol::CreditsSnapshot;
     use codex_core::protocol::McpInvocation;
@@ -1767,6 +1953,7 @@ mod tests {
     use codex_core::protocol::RateLimitWindow;
     use codex_core::protocol::TokenUsage;
     use codex_core::protocol::TokenUsageInfo;
+    use codex_protocol::config_types::Settings;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use mcp_types::CallToolResult;
@@ -1775,11 +1962,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::Value as JsonValue;
     use std::collections::HashMap;
+    use std::collections::VecDeque;
     use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
 
     fn new_turn_summary_store() -> TurnSummaryStore {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn new_turn_mode_store() -> TurnModeStore {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn new_pending_turn_modes() -> PendingTurnModes {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
@@ -1826,11 +2022,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
         let turn_summary_store = new_turn_summary_store();
+        let turn_mode_store = new_turn_mode_store();
 
         handle_turn_complete(
             conversation_id,
             event_turn_id.clone(),
             &outgoing,
+            &turn_mode_store,
             &turn_summary_store,
         )
         .await;
@@ -1856,6 +2054,7 @@ mod tests {
         let conversation_id = ThreadId::new();
         let event_turn_id = "interrupt1".to_string();
         let turn_summary_store = new_turn_summary_store();
+        let turn_mode_store = new_turn_mode_store();
         handle_error(
             conversation_id,
             TurnError {
@@ -1873,6 +2072,7 @@ mod tests {
             conversation_id,
             event_turn_id.clone(),
             &outgoing,
+            &turn_mode_store,
             &turn_summary_store,
         )
         .await;
@@ -1898,6 +2098,7 @@ mod tests {
         let conversation_id = ThreadId::new();
         let event_turn_id = "complete_err1".to_string();
         let turn_summary_store = new_turn_summary_store();
+        let turn_mode_store = new_turn_mode_store();
         handle_error(
             conversation_id,
             TurnError {
@@ -1915,6 +2116,7 @@ mod tests {
             conversation_id,
             event_turn_id.clone(),
             &outgoing,
+            &turn_mode_store,
             &turn_summary_store,
         )
         .await;
@@ -1943,9 +2145,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_turn_mode_records_plan_mode() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let event_turn_id = "turn-snapshot";
+        let pending_turn_modes = new_pending_turn_modes();
+        let turn_mode_store = new_turn_mode_store();
+        let turn_summary_store = new_turn_summary_store();
+        let plan_mode = CollaborationMode::Plan(Settings {
+            model: "mock-model".to_string(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        });
+        {
+            let mut pending = pending_turn_modes.lock().await;
+            pending.insert(
+                conversation_id.clone(),
+                VecDeque::from([Some(plan_mode.clone())]),
+            );
+        }
+
+        snapshot_turn_mode(
+            conversation_id.clone(),
+            event_turn_id,
+            &pending_turn_modes,
+            &turn_mode_store,
+            &turn_summary_store,
+        )
+        .await;
+
+        let key = (conversation_id.clone(), event_turn_id.to_string());
+        let modes = turn_mode_store.lock().await;
+        assert_eq!(modes.get(&key), Some(&plan_mode));
+        drop(modes);
+
+        let summaries = turn_summary_store.lock().await;
+        let summary = summaries
+            .get(&conversation_id)
+            .ok_or_else(|| anyhow!("summary should exist"))?;
+        assert_eq!(summary.turn_mode.as_ref(), Some(&plan_mode));
+        drop(summaries);
+
+        let pending = pending_turn_modes.lock().await;
+        assert!(!pending.contains_key(&conversation_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_mode_turn_complete_emits_plan_item() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let event_turn_id = "plan_turn".to_string();
+        let turn_summary_store = new_turn_summary_store();
+        let turn_mode_store = new_turn_mode_store();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+
+        let plan_mode = CollaborationMode::Plan(Settings {
+            model: "mock-model".to_string(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        });
+        let explanation = Some("plan it".to_string());
+        let plan_update = UpdatePlanArgs {
+            explanation: explanation.clone(),
+            plan: vec![
+                PlanItemArg {
+                    step: "first".to_string(),
+                    status: StepStatus::Pending,
+                },
+                PlanItemArg {
+                    step: "second".to_string(),
+                    status: StepStatus::Completed,
+                },
+            ],
+        };
+        let expected_plan = plan_update
+            .plan
+            .clone()
+            .into_iter()
+            .map(TurnPlanStep::from)
+            .collect();
+        let expected_item = ThreadItem::Plan {
+            id: format!("{event_turn_id}-plan"),
+            explanation,
+            plan: expected_plan,
+        };
+        {
+            let mut map = turn_summary_store.lock().await;
+            map.insert(
+                conversation_id,
+                TurnSummary {
+                    turn_mode: Some(plan_mode),
+                    last_plan_update: Some(plan_update),
+                    ..Default::default()
+                },
+            );
+        }
+
+        handle_turn_complete(
+            conversation_id,
+            event_turn_id.clone(),
+            &outgoing,
+            &turn_mode_store,
+            &turn_summary_store,
+        )
+        .await;
+
+        let started = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("should send plan started"))?;
+        match started {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(n)) => {
+                assert_eq!(n.turn_id, event_turn_id);
+                assert_eq!(n.item, expected_item.clone());
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let completed = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("should send plan completed"))?;
+        match completed {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(n)) => {
+                assert_eq!(n.turn_id, event_turn_id);
+                assert_eq!(n.item, expected_item.clone());
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let turn_complete = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("should send turn completed"))?;
+        match turn_complete {
+            OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
+                assert_eq!(n.turn.status, TurnStatus::Completed);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_handle_turn_plan_update_emits_notification_for_v2() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = OutgoingMessageSender::new(tx);
+        let turn_summary_store = new_turn_summary_store();
         let update = UpdatePlanArgs {
             explanation: Some("need plan".to_string()),
             plan: vec![
@@ -1968,6 +2315,7 @@ mod tests {
             update,
             ApiVersion::V2,
             &outgoing,
+            &turn_summary_store,
         )
         .await;
 
@@ -2146,6 +2494,7 @@ mod tests {
         let conversation_a = ThreadId::new();
         let conversation_b = ThreadId::new();
         let turn_summary_store = new_turn_summary_store();
+        let turn_mode_store = new_turn_mode_store();
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
@@ -2166,6 +2515,7 @@ mod tests {
             conversation_a,
             a_turn1.clone(),
             &outgoing,
+            &turn_mode_store,
             &turn_summary_store,
         )
         .await;
@@ -2186,6 +2536,7 @@ mod tests {
             conversation_b,
             b_turn1.clone(),
             &outgoing,
+            &turn_mode_store,
             &turn_summary_store,
         )
         .await;
@@ -2196,6 +2547,7 @@ mod tests {
             conversation_a,
             a_turn2.clone(),
             &outgoing,
+            &turn_mode_store,
             &turn_summary_store,
         )
         .await;

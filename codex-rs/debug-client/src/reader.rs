@@ -229,6 +229,27 @@ fn emit_filtered_item(item: ThreadItem, thread_id: &str, output: &Output) -> any
             let label = output.format_label("assistant", LabelColor::Assistant);
             output.server_line(&format!("{thread_label} {label}: {text}"))?;
         }
+        ThreadItem::Plan {
+            explanation, plan, ..
+        } => {
+            let label = output.format_label("plan", LabelColor::Assistant);
+            let step_count = plan.len();
+            output.server_line(&format!("{thread_label} {label}: {step_count} step(s)"))?;
+            if let Some(explanation) = explanation {
+                write_multiline(
+                    output,
+                    &thread_label,
+                    &format!("{label} note:"),
+                    &explanation,
+                )?;
+            }
+            for step_entry in plan {
+                let status = step_entry.status;
+                let step = step_entry.step;
+                let status_label = format!("{status:?}").to_lowercase();
+                output.server_line(&format!("{thread_label} {label}: [{status_label}] {step}"))?;
+            }
+        }
         ThreadItem::CommandExecution {
             command,
             status,

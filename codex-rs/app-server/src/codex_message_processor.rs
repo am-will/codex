@@ -168,10 +168,12 @@ use codex_login::ServerOptions as LoginServerOptions;
 use codex_login::ShutdownHandle;
 use codex_login::run_login_server;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use codex_protocol::protocol::McpServerRefreshConfig;
@@ -184,6 +186,7 @@ use codex_rmcp_client::perform_oauth_login_return_url;
 use codex_utils_json_to_toml::json_to_toml;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::Error as IoError;
 use std::path::Path;
@@ -212,9 +215,14 @@ pub(crate) type PendingRollbacks = Arc<Mutex<HashMap<ThreadId, RequestId>>>;
 pub(crate) struct TurnSummary {
     pub(crate) file_change_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
+    pub(crate) turn_mode: Option<CollaborationMode>,
+    pub(crate) last_plan_update: Option<UpdatePlanArgs>,
 }
 
 pub(crate) type TurnSummaryStore = Arc<Mutex<HashMap<ThreadId, TurnSummary>>>;
+pub(crate) type PendingTurnModes =
+    Arc<Mutex<HashMap<ThreadId, VecDeque<Option<CollaborationMode>>>>>;
+pub(crate) type TurnModeStore = Arc<Mutex<HashMap<(ThreadId, String), CollaborationMode>>>;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -252,6 +260,9 @@ pub(crate) struct CodexMessageProcessor {
     pending_interrupts: PendingInterrupts,
     // Queue of pending rollback requests per conversation. We reply when ThreadRollback arrives.
     pending_rollbacks: PendingRollbacks,
+    current_collaboration_modes: HashMap<ThreadId, CollaborationMode>,
+    pending_turn_modes: PendingTurnModes,
+    turn_mode_store: TurnModeStore,
     turn_summary_store: TurnSummaryStore,
     pending_fuzzy_searches: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     feedback: CodexFeedback,
@@ -308,6 +319,9 @@ impl CodexMessageProcessor {
             active_login: Arc::new(Mutex::new(None)),
             pending_interrupts: Arc::new(Mutex::new(HashMap::new())),
             pending_rollbacks: Arc::new(Mutex::new(HashMap::new())),
+            current_collaboration_modes: HashMap::new(),
+            pending_turn_modes: Arc::new(Mutex::new(HashMap::new())),
+            turn_mode_store: Arc::new(Mutex::new(HashMap::new())),
             turn_summary_store: Arc::new(Mutex::new(HashMap::new())),
             pending_fuzzy_searches: Arc::new(Mutex::new(HashMap::new())),
             feedback,
@@ -3600,8 +3614,23 @@ impl CodexMessageProcessor {
         let _ = conversation.submit(Op::Interrupt).await;
     }
 
-    async fn turn_start(&self, request_id: RequestId, params: TurnStartParams) {
-        let (_, thread) = match self.load_thread(&params.thread_id).await {
+    async fn turn_start(&mut self, request_id: RequestId, params: TurnStartParams) {
+        let TurnStartParams {
+            thread_id: thread_id_str,
+            input,
+            cwd,
+            approval_policy,
+            sandbox_policy,
+            model,
+            effort,
+            summary,
+            collaboration_mode,
+            personality,
+            output_schema,
+            ..
+        } = params;
+
+        let (thread_id, thread) = match self.load_thread(&thread_id_str).await {
             Ok(v) => v,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -3609,34 +3638,46 @@ impl CodexMessageProcessor {
             }
         };
 
-        // Map v2 input items to core input items.
-        let mapped_items: Vec<CoreInputItem> = params
-            .input
-            .into_iter()
-            .map(V2UserInput::into_core)
-            .collect();
+        let effective_mode = collaboration_mode
+            .clone()
+            .or_else(|| self.current_collaboration_modes.get(&thread_id).cloned());
+        if let Some(mode) = collaboration_mode.clone() {
+            self.current_collaboration_modes
+                .insert(thread_id.clone(), mode);
+        }
+        {
+            let mut pending = self.pending_turn_modes.lock().await;
+            pending
+                .entry(thread_id.clone())
+                .or_default()
+                .push_back(effective_mode);
+        }
 
-        let has_any_overrides = params.cwd.is_some()
-            || params.approval_policy.is_some()
-            || params.sandbox_policy.is_some()
-            || params.model.is_some()
-            || params.effort.is_some()
-            || params.summary.is_some()
-            || params.collaboration_mode.is_some()
-            || params.personality.is_some();
+        // Map v2 input items to core input items.
+        let mapped_items: Vec<CoreInputItem> =
+            input.into_iter().map(V2UserInput::into_core).collect();
+
+        let has_any_overrides = cwd.is_some()
+            || approval_policy.is_some()
+            || sandbox_policy.is_some()
+            || model.is_some()
+            || effort.is_some()
+            || summary.is_some()
+            || collaboration_mode.is_some()
+            || personality.is_some();
 
         // If any overrides are provided, update the session turn context first.
         if has_any_overrides {
             let _ = thread
                 .submit(Op::OverrideTurnContext {
-                    cwd: params.cwd,
-                    approval_policy: params.approval_policy.map(AskForApproval::to_core),
-                    sandbox_policy: params.sandbox_policy.map(|p| p.to_core()),
-                    model: params.model,
-                    effort: params.effort.map(Some),
-                    summary: params.summary,
-                    collaboration_mode: params.collaboration_mode,
-                    personality: params.personality,
+                    cwd,
+                    approval_policy: approval_policy.map(AskForApproval::to_core),
+                    sandbox_policy: sandbox_policy.map(|p| p.to_core()),
+                    model,
+                    effort: effort.map(Some),
+                    summary,
+                    collaboration_mode,
+                    personality,
                 })
                 .await;
         }
@@ -3645,7 +3686,7 @@ impl CodexMessageProcessor {
         let turn_id = thread
             .submit(Op::UserInput {
                 items: mapped_items,
-                final_output_json_schema: params.output_schema,
+                final_output_json_schema: output_schema,
             })
             .await;
 
@@ -3663,7 +3704,7 @@ impl CodexMessageProcessor {
 
                 // Emit v2 turn/started notification.
                 let notif = TurnStartedNotification {
-                    thread_id: params.thread_id,
+                    thread_id: thread_id_str,
                     turn,
                 };
                 self.outgoing
@@ -3671,6 +3712,13 @@ impl CodexMessageProcessor {
                     .await;
             }
             Err(err) => {
+                let mut pending = self.pending_turn_modes.lock().await;
+                if let Some(queue) = pending.get_mut(&thread_id) {
+                    queue.pop_back();
+                    if queue.is_empty() {
+                        pending.remove(&thread_id);
+                    }
+                }
                 let error = JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: format!("failed to start turn: {err}"),
@@ -4002,6 +4050,8 @@ impl CodexMessageProcessor {
         let outgoing_for_task = self.outgoing.clone();
         let pending_interrupts = self.pending_interrupts.clone();
         let pending_rollbacks = self.pending_rollbacks.clone();
+        let pending_turn_modes = self.pending_turn_modes.clone();
+        let turn_mode_store = self.turn_mode_store.clone();
         let turn_summary_store = self.turn_summary_store.clone();
         let api_version_for_task = api_version;
         let fallback_model_provider = self.config.model_provider_id.clone();
@@ -4065,6 +4115,8 @@ impl CodexMessageProcessor {
                             outgoing_for_task.clone(),
                             pending_interrupts.clone(),
                             pending_rollbacks.clone(),
+                            pending_turn_modes.clone(),
+                            turn_mode_store.clone(),
                             turn_summary_store.clone(),
                             api_version_for_task,
                             fallback_model_provider.clone(),
