@@ -3642,13 +3642,12 @@ impl CodexMessageProcessor {
             .clone()
             .or_else(|| self.current_collaboration_modes.get(&thread_id).cloned());
         if let Some(mode) = collaboration_mode.clone() {
-            self.current_collaboration_modes
-                .insert(thread_id.clone(), mode);
+            self.current_collaboration_modes.insert(thread_id, mode);
         }
         {
             let mut pending = self.pending_turn_modes.lock().await;
             pending
-                .entry(thread_id.clone())
+                .entry(thread_id)
                 .or_default()
                 .push_back(effective_mode);
         }

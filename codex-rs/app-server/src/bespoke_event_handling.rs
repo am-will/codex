@@ -1165,7 +1165,7 @@ async fn snapshot_turn_mode(
         let mut pending = pending_turn_modes.lock().await;
         let next_mode = pending
             .get_mut(&conversation_id)
-            .and_then(|queue| queue.pop_front())
+            .and_then(std::collections::VecDeque::pop_front)
             .flatten();
         let should_remove = pending
             .get(&conversation_id)
@@ -1180,7 +1180,7 @@ async fn snapshot_turn_mode(
         {
             let mut modes = turn_mode_store.lock().await;
             modes.insert(
-                (conversation_id.clone(), event_turn_id.to_string()),
+                (conversation_id, event_turn_id.to_string()),
                 turn_mode.clone(),
             );
         }
@@ -1397,7 +1397,7 @@ async fn handle_turn_complete(
 ) {
     {
         let mut modes = turn_mode_store.lock().await;
-        modes.remove(&(conversation_id.clone(), event_turn_id.clone()));
+        modes.remove(&(conversation_id, event_turn_id.clone()));
     }
     let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
     let TurnSummary {
@@ -1418,13 +1418,7 @@ async fn handle_turn_complete(
         && plan_mode
         && let Some(plan_update) = last_plan_update
     {
-        emit_plan_item(
-            conversation_id.clone(),
-            &event_turn_id,
-            plan_update,
-            outgoing,
-        )
-        .await;
+        emit_plan_item(conversation_id, &event_turn_id, plan_update, outgoing).await;
     }
     emit_turn_completed_with_status(conversation_id, event_turn_id, status, error, outgoing).await;
 }
@@ -1438,7 +1432,7 @@ async fn handle_turn_interrupted(
 ) {
     {
         let mut modes = turn_mode_store.lock().await;
-        modes.remove(&(conversation_id.clone(), event_turn_id.clone()));
+        modes.remove(&(conversation_id, event_turn_id.clone()));
     }
     find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
 
@@ -2158,14 +2152,11 @@ mod tests {
         });
         {
             let mut pending = pending_turn_modes.lock().await;
-            pending.insert(
-                conversation_id.clone(),
-                VecDeque::from([Some(plan_mode.clone())]),
-            );
+            pending.insert(conversation_id, VecDeque::from([Some(plan_mode.clone())]));
         }
 
         snapshot_turn_mode(
-            conversation_id.clone(),
+            conversation_id,
             event_turn_id,
             &pending_turn_modes,
             &turn_mode_store,
@@ -2173,7 +2164,7 @@ mod tests {
         )
         .await;
 
-        let key = (conversation_id.clone(), event_turn_id.to_string());
+        let key = (conversation_id, event_turn_id.to_string());
         let modes = turn_mode_store.lock().await;
         assert_eq!(modes.get(&key), Some(&plan_mode));
         drop(modes);
