@@ -45,6 +45,8 @@ use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
@@ -1051,11 +1053,11 @@ impl SessionHeaderHistoryCell {
         if !self.is_collaboration {
             return None;
         }
-        match &self.collaboration_mode {
-            CollaborationMode::Plan(_) => Some("Plan"),
-            CollaborationMode::PairProgramming(_) => Some("Pair Programming"),
-            CollaborationMode::Execute(_) => Some("Execute"),
-            CollaborationMode::Custom(_) => None,
+        match self.collaboration_mode.mode {
+            ModeKind::Plan => Some("Plan"),
+            ModeKind::PairProgramming => Some("Pair Programming"),
+            ModeKind::Execute => Some("Execute"),
+            ModeKind::Custom => None,
         }
     }
 
@@ -2347,11 +2349,14 @@ mod tests {
             std::env::temp_dir(),
             "test",
             false,
-            CollaborationMode::Custom(Settings {
-                model: "gpt-4o".to_string(),
-                reasoning_effort: Some(ReasoningEffortConfig::High),
-                developer_instructions: None,
-            }),
+            CollaborationMode {
+                mode: ModeKind::Custom,
+                settings: Settings {
+                    model: "gpt-4o".to_string(),
+                    reasoning_effort: Some(ReasoningEffortConfig::High),
+                    developer_instructions: None,
+                },
+            },
         );
 
         let lines = render_lines(&cell.display_lines(80));

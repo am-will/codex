@@ -295,11 +295,14 @@ impl Codex {
 
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
-        let collaboration_mode = CollaborationMode::Custom(Settings {
-            model: model.clone(),
-            reasoning_effort: config.model_reasoning_effort,
-            developer_instructions: None,
-        });
+        let collaboration_mode = CollaborationMode {
+            mode: ModeKind::Custom,
+            settings: Settings {
+                model: model.clone(),
+                reasoning_effort: config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        };
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
@@ -2291,11 +2294,14 @@ mod handlers {
                 personality,
             } => {
                 let collaboration_mode = collaboration_mode.or_else(|| {
-                    Some(CollaborationMode::Custom(Settings {
-                        model: model.clone(),
-                        reasoning_effort: effort,
-                        developer_instructions: None,
-                    }))
+                    Some(CollaborationMode {
+                        mode: ModeKind::Custom,
+                        settings: Settings {
+                            model: model.clone(),
+                            reasoning_effort: effort,
+                            developer_instructions: None,
+                        },
+                    })
                 });
                 (
                     items,
@@ -3878,11 +3884,14 @@ mod tests {
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
         let reasoning_effort = config.model_reasoning_effort;
-        let collaboration_mode = CollaborationMode::Custom(Settings {
-            model,
-            reasoning_effort,
-            developer_instructions: None,
-        });
+        let collaboration_mode = CollaborationMode {
+            mode: ModeKind::Custom,
+            settings: Settings {
+                model,
+                reasoning_effort,
+                developer_instructions: None,
+            },
+        };
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
@@ -3954,11 +3963,14 @@ mod tests {
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
         let reasoning_effort = config.model_reasoning_effort;
-        let collaboration_mode = CollaborationMode::Custom(Settings {
-            model,
-            reasoning_effort,
-            developer_instructions: None,
-        });
+        let collaboration_mode = CollaborationMode {
+            mode: ModeKind::Custom,
+            settings: Settings {
+                model,
+                reasoning_effort,
+                developer_instructions: None,
+            },
+        };
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
@@ -4214,11 +4226,14 @@ mod tests {
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
         let reasoning_effort = config.model_reasoning_effort;
-        let collaboration_mode = CollaborationMode::Custom(Settings {
-            model,
-            reasoning_effort,
-            developer_instructions: None,
-        });
+        let collaboration_mode = CollaborationMode {
+            mode: ModeKind::Custom,
+            settings: Settings {
+                model,
+                reasoning_effort,
+                developer_instructions: None,
+            },
+        };
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
@@ -4319,11 +4334,14 @@ mod tests {
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
         let reasoning_effort = config.model_reasoning_effort;
-        let collaboration_mode = CollaborationMode::Custom(Settings {
-            model,
-            reasoning_effort,
-            developer_instructions: None,
-        });
+        let collaboration_mode = CollaborationMode {
+            mode: ModeKind::Custom,
+            settings: Settings {
+                model,
+                reasoning_effort,
+                developer_instructions: None,
+            },
+        };
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
