@@ -50,7 +50,6 @@ cargo run --bin codex-tui -- "your prompt here"  # terminal UI
 Create `~/.codex/config.toml`:
 
 ```toml
-use_linux_sandbox_bwrap = true
 
 [agents]
 max_threads = 12
