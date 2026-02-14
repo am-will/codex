@@ -55,7 +55,7 @@ source ~/.bashrc
 Now you can run it from anywhere:
 
 ```bash
-codex
+cdx
 ```
 
 ## 6. Configure (optional)
