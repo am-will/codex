@@ -38,11 +38,24 @@ cd codex/codex-rs
 cargo build
 ```
 
-## 5. Run
+## 5. Set Up Alias
+
+Add this to your `~/.bashrc` (or `~/.zshrc`):
 
 ```bash
-cargo run --bin codex -- "your prompt here"     # headless
-cargo run --bin codex-tui -- "your prompt here"  # terminal UI
+alias codex='cargo run --manifest-path ~/codex/codex-rs/Cargo.toml --bin codex-tui --'
+```
+
+Then reload your shell:
+
+```bash
+source ~/.bashrc
+```
+
+Now you can run it from anywhere:
+
+```bash
+codex
 ```
 
 ## 6. Configure (optional)
