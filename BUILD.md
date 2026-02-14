@@ -27,7 +27,6 @@ The repo pins Rust **1.93.0 stable** via `rust-toolchain.toml` — rustup will h
 
 ```bash
 cargo install just
-cargo install cargo-nextest  # optional, faster test runner
 ```
 
 ## 4. Clone & Build
