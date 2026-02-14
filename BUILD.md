@@ -43,7 +43,7 @@ cargo build
 Add this to your `~/.bashrc` (or `~/.zshrc`):
 
 ```bash
-alias codex='cargo run --manifest-path ~/codex/codex-rs/Cargo.toml --bin codex-tui --'
+alias cdx='cargo run --manifest-path ~/codex/codex-rs/Cargo.toml --bin codex-tui --'
 ```
 
 Then reload your shell:
